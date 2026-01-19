@@ -77,6 +77,7 @@ jobs:
             if [ -n "${PREV_TAG}" ]; then
               RANGE="${PREV_TAG}..${TAG_NAME}"
             else
+              # first tag fallback: last 100 commits reachable from the tag
               RANGE="$(git rev-list --max-count=100 ${TAG_NAME})"
             fi
 
@@ -107,7 +108,7 @@ jobs:
         with:
           email:       ${{ secrets.JIRA_EMAIL }}
           api-token:   ${{ secrets.JIRA_TOKEN }}
-          subdomain:   ${{ secrets.JIRA_SUBDOMAIN }}   # e.g., 'capitecbank' for https://capitecbank.atlassian.net
+          subdomain:   ${{ secrets.JIRA_SUBDOMAIN }}   # e.g., 'your-subdomain' for https://your-subdomain.atlassian.net
           jira_project: SMP
           release_name: next
           create: true
@@ -128,8 +129,7 @@ jobs:
           IFS=',' read -ra KEYS <<< "${JIRA_TICKETS}"
           echo "Commenting repo '${REPO_NAME}' on ${#KEYS[@]} issues..."
 
-          # Use ADF body per Jira Cloud v3 comment API
-          # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/
+          # ADF body per Jira Cloud v3 comment API
           for KEY in "${KEYS[@]}"; do
             ISSUE="$(echo "$KEY" | xargs)"
             ADF=$(jq -n --arg t "Repo: ${REPO_NAME}" '{
@@ -156,7 +156,7 @@ jobs:
             fi
           done
 
-      # ---------- (Your existing deployment status attachment) ----------
+      # ---------- (Existing deployment status attachment) ----------
       - name: Attach Tag Metadata to Deployment
         if: always()
         shell: bash
@@ -180,4 +180,3 @@ jobs:
             -f environment="${{ inputs.environment || 'staging' }}" \
             -f log_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             -f auto_inactive=true
-``

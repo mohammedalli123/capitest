@@ -53,6 +53,17 @@ jobs:
           ref: ${{ env.REF }}
           fetch-depth: 0  # needed to compute commit ranges and previous tags
 
+      - name: Resolve repository name
+        shell: bash
+        run: |
+          # Prefer github.event.repository.name; fall back to parsing GITHUB_REPOSITORY
+          if [ -n "${{ github.event.repository.name }}" ]; then
+            echo "REPO_NAME=${{ github.event.repository.name }}" >> $GITHUB_ENV
+          else
+            echo "REPO_NAME=${GITHUB_REPOSITORY#*/}" >> $GITHUB_ENV
+          fi
+          echo "RELEASE_NAME=next_${REPO_NAME}" >> $GITHUB_ENV
+
       - name: Mock deploy
         shell: bash
         run: |
@@ -100,41 +111,149 @@ jobs:
           echo "Discovered Jira keys: ${KEYS}"
           echo "JIRA_TICKETS=${KEYS}" >> $GITHUB_ENV
 
-      # ---------- CREATE/UPDATE JIRA RELEASE: ALWAYS 'next' ON STAGING ----------
-      - name: Add issues to Jira release 'next'
-        if: ${{ (inputs.environment || 'staging') == 'staging' && env.JIRA_TICKETS != '' }}
-        uses: justin-jhg/jira-release-actions@v2
-        with:
-          jira_base_url: https://${{ secrets.JIRA_SUBDOMAIN }}.atlassian.net
-          jira_user_email: ${{ secrets.JIRA_EMAIL }}
-          jira_api_token: ${{ secrets.JIRA_TOKEN }}
-          jira_project: SMP
-          release_name: next
-          tickets: ${{ env.JIRA_TICKETS }}
-          create: true
-          release: false
-          archive: false
-          time_zone: UTC                  # or: Africa/Johannesburg
-
-      # ---------- ADD A COMMENT WITH THE REPO NAME TO EACH JIRA ISSUE ----------
-      - name: Comment repo name on Jira issues
+      # ---------- FILTER OUT ISSUES ALREADY DEPLOYED TO PRODUCTION ----------
+      - name: Exclude issues already deployed to production
         if: ${{ env.JIRA_TICKETS != '' }}
         shell: bash
         env:
           JIRA_BASE_URL: https://${{ secrets.JIRA_SUBDOMAIN }}.atlassian.net
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
-          REPO_NAME: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
 
           IFS=',' read -ra KEYS <<< "${JIRA_TICKETS}"
-          echo "Commenting repo '${REPO_NAME}' on ${#KEYS[@]} issues..."
+          FILTERED=()
 
-          # ADF body per Jira Cloud v3 comment API
+          get_issue_id () {
+            curl -s -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              -H "Accept: application/json" \
+              "${JIRA_BASE_URL}/rest/api/3/issue/$1?fields=id" \
+              | jq -r '.id'
+          }
+
+          get_providers () {
+            jq -r '
+              .summary as $s
+              | [$s["deployment"].byInstanceType, $s["deployment-environment"].byInstanceType]
+              | map(. // {}) | add
+              | keys[]? ' 2>/dev/null
+          }
+
+          has_prod_success () {
+            local issueId="$1" provider="$2" dtype="$3"
+            local url="${JIRA_BASE_URL}/rest/dev-status/latest/issue/detail?issueId=${issueId}&applicationType=${provider}&dataType=${dtype}"
+            local detail
+            detail="$(curl -s -u "${JIRA_EMAIL}:${JIRA_TOKEN}" -H "Accept: application/json" "$url")" || return 1
+
+            echo "$detail" | jq -e '
+              (.detail // .details // []) as $blocks
+              | if ($blocks | length) == 0 then false else
+                  ( $blocks
+                    | map(
+                        ( .deployments // [] )
+                        + ( ( .environments // [] ) | map( .deployments // [] ) | add )
+                      )
+                    | add
+                  ) as $deps
+                  | if ($deps | length) == 0 then false else
+                      $deps
+                      | map({
+                          envName: ( .environment.name // .environmentName // (._env_container?.name // "") ),
+                          envType: ( .environment.type // .environmentType // (._env_container?.type // "") ),
+                          state:   ( .state // .status // .deploymentState // "" )
+                        })
+                      | map(
+                          ( ( ( .envName | ascii_downcase ) | contains("prod") ) or
+                            ( ( .envType | ascii_downcase ) | contains("prod") ) or
+                            ( ( .envName // "" | ascii_downcase ) == "production" ) or
+                            ( ( .envType // "" | ascii_downcase ) == "production" )
+                          )
+                          and ( ( .state | ascii_downcase ) | contains("success") )
+                        )
+                      | any
+                    end
+                end
+            ' >/dev/null
+          }
+
+          for KEY in "${KEYS[@]}"; do
+            ISSUE_KEY="$(echo "$KEY" | xargs)"
+            ISSUE_ID="$( get_issue_id "$ISSUE_KEY" )" || ISSUE_ID=""
+
+            if [ -z "$ISSUE_ID" ] || [ "$ISSUE_ID" = "null" ]; then
+              echo "WARN: Could not resolve issue id for ${ISSUE_KEY}; keeping it."
+              FILTERED+=("$ISSUE_KEY")
+              continue
+            fi
+
+            SUMMARY_JSON="$(curl -s -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+                              -H "Accept: application/json" \
+                              "${JIRA_BASE_URL}/rest/dev-status/latest/issue/summary?issueId=${ISSUE_ID}")"
+
+            PROVIDERS=$(echo "$SUMMARY_JSON" | get_providers || true)
+
+            PROD_SUCCESS="false"
+            if [ -n "$PROVIDERS" ]; then
+              while IFS= read -r P; do
+                for DT in deployment deployment-environment; do
+                  if has_prod_success "$ISSUE_ID" "$P" "$DT"; then
+                    PROD_SUCCESS="true"
+                    break
+                  fi
+                done
+                [ "$PROD_SUCCESS" = "true" ] && break
+              done <<< "$PROVIDERS"
+            fi
+
+            if [ "$PROD_SUCCESS" = "true" ]; then
+              echo "Skipping ${ISSUE_KEY} (already deployed to production)"
+            else
+              FILTERED+=("$ISSUE_KEY")
+            fi
+          done
+
+          if [ "${#FILTERED[@]}" -gt 0 ]; then
+            (IFS=','; echo "JIRA_TICKETS_FILTERED=${FILTERED[*]}" >> $GITHUB_ENV)
+            echo "Kept ${#FILTERED[@]} issues for staging processing."
+          else
+            echo "JIRA_TICKETS_FILTERED=" >> $GITHUB_ENV
+            echo "No issues left after filtering."
+          fi
+
+      # ---------- CREATE/UPDATE JIRA RELEASE: ALWAYS 'next_<repo>' ON STAGING ----------
+      - name: Add issues to Jira release 'next_<repo>'
+        if: ${{ (inputs.environment || 'staging') == 'staging' && env.JIRA_TICKETS_FILTERED != '' }}
+        uses: justin-jhg/jira-release-actions@v2
+        with:
+          jira_base_url: https://${{ secrets.JIRA_SUBDOMAIN }}.atlassian.net
+          jira_user_email: ${{ secrets.JIRA_EMAIL }}
+          jira_api_token: ${{ secrets.JIRA_TOKEN }}
+          jira_project: SMP
+          release_name: ${{ env.RELEASE_NAME }}    # next_<repo>
+          tickets: ${{ env.JIRA_TICKETS_FILTERED }}
+          create: true
+          release: false
+          archive: false
+          time_zone: UTC                           # avoid invalid timezone errors
+
+      # ---------- COMMENT *TAG* ON EACH (FILTERED) JIRA ISSUE ----------
+      - name: Comment tag on Jira issues
+        if: ${{ env.JIRA_TICKETS_FILTERED != '' && env.TAG_NAME != '' }}
+        shell: bash
+        env:
+          JIRA_BASE_URL: https://${{ secrets.JIRA_SUBDOMAIN }}.atlassian.net
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -ra KEYS <<< "${JIRA_TICKETS_FILTERED}"
+          echo "Commenting tag '${TAG_NAME}' on ${#KEYS[@]} issues..."
+
           for KEY in "${KEYS[@]}"; do
             ISSUE="$(echo "$KEY" | xargs)"
-            ADF=$(jq -n --arg t "Repo: ${REPO_NAME}" '{
+            ADF=$(jq -n --arg t "Tag: ${TAG_NAME}" '{
               body: {
                 type: "doc",
                 version: 1,

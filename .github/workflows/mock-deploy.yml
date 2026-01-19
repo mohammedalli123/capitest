@@ -2,23 +2,64 @@
 name: Mock Deployment
 
 on:
-  workflow_dispatch:   # lets you trigger it manually
+  # Auto-trigger on pushes to specific branches OR any semver-style tag
   push:
     branches:
       - main
+      - release/*
+    tags:
+      - 'v*'           # e.g., v1.2.3
+  # Allow manual trigger from any ref with inputs
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or tag to deploy (e.g., main or v1.2.3)'
+        required: false
+        default: ''
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+run-name: >
+  Mock deploy to ${{ inputs.environment || 'staging' }}
+  on ${{ inputs.ref || github.ref_name }} by @${{ github.actor }}
 
 jobs:
   deploy:
+    # If manual, use inputs; otherwise infer from event context
+    # This job runs for push AND workflow_dispatch; you can fine-tune with if:
     runs-on: ubuntu-latest
 
-    environment: staging   # <- tells GitHub this is a deployment
+    # Using an environment enables GitHub "deployment" metadata (Jira will pick it up)
+    environment: ${{ inputs.environment || 'staging' }}
 
     steps:
+      - name: Resolve ref to checkout
+        id: ref
+        run: |
+          # Prefer manual input ref; otherwise use the event ref
+          if [ -n "${{ github.event.inputs.ref }}" ]; then
+            echo "REF=${{ github.event.inputs.ref }}" >> $GITHUB_ENV
+          else
+            echo "REF=${{ github.ref_name }}" >> $GITHUB_ENV
+          fi
+
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          # Checkout the selected branch OR tag
+          ref: ${{ env.REF }}
 
       - name: Mock deploy
-        run: echo "Simulating deployment..."
+        run: |
+          echo "Simulating deployment for ref=$REF to env=${{ inputs.environment || 'staging' }}..."
+          sleep 2
+          echo "Done."
 
       - name: Mark deployment success
-        run: echo "This mock deployment is complete."
+        run: echo "Mock deployment completed successfully."

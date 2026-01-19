@@ -77,7 +77,6 @@ jobs:
             if [ -n "${PREV_TAG}" ]; then
               RANGE="${PREV_TAG}..${TAG_NAME}"
             else
-              # first tag fallback: last 100 commits reachable from the tag
               RANGE="$(git rev-list --max-count=100 ${TAG_NAME})"
             fi
 
@@ -104,15 +103,17 @@ jobs:
       # ---------- CREATE/UPDATE JIRA RELEASE: ALWAYS 'next' ON STAGING ----------
       - name: Add issues to Jira release 'next'
         if: ${{ (inputs.environment || 'staging') == 'staging' && env.JIRA_TICKETS != '' }}
-        uses: charpi/jira-release-action@latest
+        uses: justin-jhg/jira-release-actions@v2
         with:
-          email:       ${{ secrets.JIRA_EMAIL }}
-          api-token:   ${{ secrets.JIRA_TOKEN }}
-          subdomain:   ${{ secrets.JIRA_SUBDOMAIN }}   # e.g., 'your-subdomain' for https://your-subdomain.atlassian.net
+          jira_base_url: https://${{ secrets.JIRA_SUBDOMAIN }}.atlassian.net
+          jira_user_email: ${{ secrets.JIRA_EMAIL }}
+          jira_api_token: ${{ secrets.JIRA_TOKEN }}
           jira_project: SMP
           release_name: next
-          create: true
           tickets: ${{ env.JIRA_TICKETS }}
+          create: true
+          release: false
+          archive: false
 
       # ---------- ADD A COMMENT WITH THE REPO NAME TO EACH JIRA ISSUE ----------
       - name: Comment repo name on Jira issues
@@ -156,7 +157,7 @@ jobs:
             fi
           done
 
-      # ---------- (Existing deployment status attachment) ----------
+      # ---------- Attach Tag Metadata to Deployment ----------
       - name: Attach Tag Metadata to Deployment
         if: always()
         shell: bash

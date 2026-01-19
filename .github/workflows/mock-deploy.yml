@@ -1,6 +1,10 @@
 
 name: Mock Deployment
 
+permissions:
+  contents: write
+  deployments: write
+
 on:
   push:
     branches:
@@ -22,71 +26,3 @@ on:
           - dev
           - staging
           - production
-
-run-name: >
-  Mock deploy to ${{ inputs.environment || 'staging' }}
-  on ${{ inputs.ref || github.ref_name }} by @${{ github.actor }}
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-
-    # Static declaration ensures GitHub emits deployment events (required for Jira)
-    environment: ${{ inputs.environment || 'staging' }}
-
-    steps:
-      - name: Resolve ref to checkout
-        id: ref
-        run: |
-          if [ -n "${{ github.event.inputs.ref }}" ]; then
-            echo "REF=${{ github.event.inputs.ref }}" >> $GITHUB_ENV
-          else
-            echo "REF=${{ github.ref_name }}" >> $GITHUB_ENV
-          fi
-
-      - name: Determine tag name (if any)
-        id: tag
-        run: |
-          # If ref starts with "v", consider it a tag
-          if [[ "${REF}" == v* ]]; then
-            echo "TAG_NAME=${REF}" >> $GITHUB_ENV
-          else
-            # No tag provided
-            echo "TAG_NAME=" >> $GITHUB_ENV
-          fi
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.REF }}
-
-      - name: Mock deploy
-        run: |
-          echo "Simulating deployment for ref=$REF to env=${{ inputs.environment || 'staging' }}..."
-          sleep 2
-          echo "Done."
-
-      # ⭐ ADD DEPLOYMENT METADATA HERE
-      - name: Attach tag metadata to deployment
-        if: always()
-        run: |
-          # Grab deployment ID from GitHub's environment variables
-          DEPLOYMENT_URL="${{ github.api_url }}/repos/${{ github.repository }}/deployments"
-          
-          # Fetch the latest deployment (GitHub creates it automatically due to "environment:")
-          DEPLOYMENT_ID=$(gh api "$DEPLOYMENT_URL" --jq '.[0].id')
-
-          echo "Deployment ID: $DEPLOYMENT_ID"
-          echo "Tag: $TAG_NAME"
-
-          # Create deployment status including our custom metadata
-          gh api \
-            "$DEPLOYMENT_URL/$DEPLOYMENT_ID/statuses" \
-            -f state=success \
-            -f description="Deployed with tag: ${TAG_NAME}" \
-            -f environment="${{ inputs.environment || 'staging' }}" \
-            -f log_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -f auto_inactive=true
-
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

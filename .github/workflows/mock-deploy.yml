@@ -1,6 +1,7 @@
 
 name: Mock Deployment
 
+# IMPORTANT: give the workflow permission to write deployment statuses
 permissions:
   contents: write
   deployments: write
@@ -26,3 +27,99 @@ on:
           - dev
           - staging
           - production
+
+# ---------- Helper: determine the ref to deploy ----------
+# We’ll reuse identical steps across all jobs to avoid duplication.
+# (YAML anchors are supported by Actions.)
+x-common-steps: &common-steps
+  - name: Resolve ref to checkout
+    id: ref
+    shell: bash
+    run: |
+      if [ -n "${{ github.event.inputs.ref }}" ]; then
+        echo "REF=${{ github.event.inputs.ref }}" >> $GITHUB_ENV
+      else
+        echo "REF=${{ github.ref_name }}" >> $GITHUB_ENV
+      fi
+      # Detect tag name (if ref looks like a tag such as v5.0.0)
+      if [[ "${REF}" == v* ]]; then
+        echo "TAG_NAME=${REF}" >> $GITHUB_ENV
+      else
+        echo "TAG_NAME=" >> $GITHUB_ENV
+      fi
+
+  - name: Checkout code
+    uses: actions/checkout@v4
+    with:
+      ref: ${{ env.REF }}
+
+  - name: Mock deploy
+    shell: bash
+    run: |
+      echo "Simulating deployment for ref=$REF to env=$DEPLOY_ENV ..."
+      sleep 2
+      echo "Done."
+
+  # Attach tag metadata to the deployment
+  - name: Attach tag metadata to deployment
+    if: always()
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    shell: bash
+    run: |
+      # Find the most recent deployment for this environment
+      DEPLOYMENT_URL="${{ github.api_url }}/repos/${{ github.repository }}/deployments"
+      DEPLOYMENT_ID=$(gh api "$DEPLOYMENT_URL" \
+        -f environment="$DEPLOY_ENV" \
+        --jq '.[0].id' || true)
+
+      if [ -z "$DEPLOYMENT_ID" ]; then
+        echo "No deployment found for environment '$DEPLOY_ENV'."
+        exit 0
+      fi
+
+      DESC="Deployed ref: ${REF}"
+      if [ -n "$TAG_NAME" ]; then
+        DESC="${DESC} (tag: ${TAG_NAME})"
+      fi
+
+      gh api "$DEPLOYMENT_URL/$DEPLOYMENT_ID/statuses" \
+        -f state=success \
+        -f environment="$DEPLOY_ENV" \
+        -f description="$DESC" \
+        -f log_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+        -f auto_inactive=true
+
+# ---------- Jobs ----------
+jobs:
+  # Default for push to branches or tags OR manual when env = staging
+  deploy-staging:
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Set env name
+        run: echo "DEPLOY_ENV=staging" >> $GITHUB_ENV
+      <<: *common-steps
+
+  # Manual dispatch to dev
+  deploy-dev:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Set env name
+        run: echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
+      <<: *common-steps
+
+  # Manual dispatch to production
+  deploy-production:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Set env name
+        run: echo "DEPLOY_ENV=production" >> $GITHUB_ENV
+      <<: *common-steps

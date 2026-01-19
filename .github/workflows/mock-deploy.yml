@@ -2,14 +2,12 @@
 name: Mock Deployment
 
 on:
-  # Auto-trigger on pushes to specific branches OR any semver-style tag
   push:
     branches:
       - main
       - release/*
     tags:
-      - 'v*'           # e.g., v1.2.3
-  # Allow manual trigger from any ref with inputs
+      - 'v*'
   workflow_dispatch:
     inputs:
       ref:
@@ -31,28 +29,35 @@ run-name: >
 
 jobs:
   deploy:
-    # If manual, use inputs; otherwise infer from event context
-    # This job runs for push AND workflow_dispatch; you can fine-tune with if:
     runs-on: ubuntu-latest
 
-    # Using an environment enables GitHub "deployment" metadata (Jira will pick it up)
+    # Static declaration ensures GitHub emits deployment events (required for Jira)
     environment: ${{ inputs.environment || 'staging' }}
 
     steps:
       - name: Resolve ref to checkout
         id: ref
         run: |
-          # Prefer manual input ref; otherwise use the event ref
           if [ -n "${{ github.event.inputs.ref }}" ]; then
             echo "REF=${{ github.event.inputs.ref }}" >> $GITHUB_ENV
           else
             echo "REF=${{ github.ref_name }}" >> $GITHUB_ENV
           fi
 
+      - name: Determine tag name (if any)
+        id: tag
+        run: |
+          # If ref starts with "v", consider it a tag
+          if [[ "${REF}" == v* ]]; then
+            echo "TAG_NAME=${REF}" >> $GITHUB_ENV
+          else
+            # No tag provided
+            echo "TAG_NAME=" >> $GITHUB_ENV
+          fi
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # Checkout the selected branch OR tag
           ref: ${{ env.REF }}
 
       - name: Mock deploy
@@ -61,5 +66,27 @@ jobs:
           sleep 2
           echo "Done."
 
-      - name: Mark deployment success
-        run: echo "Mock deployment completed successfully."
+      # ⭐ ADD DEPLOYMENT METADATA HERE
+      - name: Attach tag metadata to deployment
+        if: always()
+        run: |
+          # Grab deployment ID from GitHub's environment variables
+          DEPLOYMENT_URL="${{ github.api_url }}/repos/${{ github.repository }}/deployments"
+          
+          # Fetch the latest deployment (GitHub creates it automatically due to "environment:")
+          DEPLOYMENT_ID=$(gh api "$DEPLOYMENT_URL" --jq '.[0].id')
+
+          echo "Deployment ID: $DEPLOYMENT_ID"
+          echo "Tag: $TAG_NAME"
+
+          # Create deployment status including our custom metadata
+          gh api \
+            "$DEPLOYMENT_URL/$DEPLOYMENT_ID/statuses" \
+            -f state=success \
+            -f description="Deployed with tag: ${TAG_NAME}" \
+            -f environment="${{ inputs.environment || 'staging' }}" \
+            -f log_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f auto_inactive=true
+
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

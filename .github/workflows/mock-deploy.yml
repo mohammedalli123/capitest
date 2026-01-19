@@ -114,6 +114,7 @@ jobs:
           create: true
           release: false
           archive: false
+          time_zone: UTC                  # or: Africa/Johannesburg
 
       # ---------- ADD A COMMENT WITH THE REPO NAME TO EACH JIRA ISSUE ----------
       - name: Comment repo name on Jira issues

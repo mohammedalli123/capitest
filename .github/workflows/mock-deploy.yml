@@ -11,21 +11,18 @@ on:
       - main
       - release/*
     tags:
-      - 'v*'
+      - '[0-9]+.[0-9]+.[0-9]+'   # semver tags like 1.2.3
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Branch or tag to deploy (e.g., main or v1.2.3)'
+        description: 'Branch or tag to deploy (e.g., main or 1.2.3)'
         required: false
         default: ''
       environment:
         description: 'Target environment'
         required: true
         type: choice
-        options:
-          - dev
-          - staging
-          - production
+        options: [dev, staging, production]
 
 jobs:
   deploy:
@@ -43,8 +40,8 @@ jobs:
             echo "REF=${{ github.ref_name }}" >> $GITHUB_ENV
           fi
 
-          # If ref looks like a tag (v*)
-          if [[ "${REF}" == v* ]]; then
+          # Tag detection: 1.2.3
+          if [[ "${REF}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "TAG_NAME=${REF}" >> $GITHUB_ENV
           else
             echo "TAG_NAME=" >> $GITHUB_ENV
@@ -54,6 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.REF }}
+          fetch-depth: 0  # needed to compute commit ranges and previous tags
 
       - name: Mock deploy
         shell: bash
@@ -61,13 +59,110 @@ jobs:
           echo "Simulating deployment for ${REF} in environment ${{ inputs.environment || 'staging' }}"
           sleep 2
 
+      # ---------- AUTO-EXTRACT JIRA ISSUE KEYS (SMP-####) ----------
+      - name: Collect Jira issue keys from commit range
+        id: collect-keys
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          uniq_join() { awk '!seen[$0]++' | paste -sd, -; }
+
+          RANGE=""
+          KEYS=""
+
+          # Case A: Tag deployment (1.2.3) -> diff against previous semver tag
+          if [ -n "${TAG_NAME}" ]; then
+            PREV_TAG=$(git tag --list --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | awk -v cur="${TAG_NAME}" 'f{print; exit} $0==cur{f=1}')
+            if [ -n "${PREV_TAG}" ]; then
+              RANGE="${PREV_TAG}..${TAG_NAME}"
+            else
+              RANGE="$(git rev-list --max-count=100 ${TAG_NAME})"
+            fi
+
+          # Case B: push to branch -> use GitHub's before..after
+          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ]; then
+            RANGE="${{ github.event.before }}..${{ github.sha }}"
+
+          else
+            # Manual / unknown -> last 100 commits on the checked-out ref
+            RANGE="$(git rev-list --max-count=100 HEAD)"
+          fi
+
+          echo "Commit range for extraction: ${RANGE:-<list>}"
+
+          if [[ "${RANGE}" == *".."* ]]; then
+            KEYS=$(git log --pretty=%B ${RANGE} | grep -oE 'SMP-[0-9]+' | uniq_join || true)
+          else
+            KEYS=$(echo "${RANGE}" | xargs -I{} git log --pretty=%B -n 1 {} | grep -oE 'SMP-[0-9]+' | uniq_join || true)
+          fi
+
+          echo "Discovered Jira keys: ${KEYS}"
+          echo "JIRA_TICKETS=${KEYS}" >> $GITHUB_ENV
+
+      # ---------- CREATE/UPDATE JIRA RELEASE: ALWAYS 'next' ON STAGING ----------
+      - name: Add issues to Jira release 'next'
+        if: ${{ (inputs.environment || 'staging') == 'staging' && env.JIRA_TICKETS != '' }}
+        uses: charpi/jira-release-action@latest
+        with:
+          email:       ${{ secrets.JIRA_EMAIL }}
+          api-token:   ${{ secrets.JIRA_TOKEN }}
+          subdomain:   ${{ secrets.JIRA_SUBDOMAIN }}   # e.g., 'capitecbank' for https://capitecbank.atlassian.net
+          jira_project: SMP
+          release_name: next
+          create: true
+          tickets: ${{ env.JIRA_TICKETS }}
+
+      # ---------- ADD A COMMENT WITH THE REPO NAME TO EACH JIRA ISSUE ----------
+      - name: Comment repo name on Jira issues
+        if: ${{ env.JIRA_TICKETS != '' }}
+        shell: bash
+        env:
+          JIRA_BASE_URL: https://${{ secrets.JIRA_SUBDOMAIN }}.atlassian.net
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -ra KEYS <<< "${JIRA_TICKETS}"
+          echo "Commenting repo '${REPO_NAME}' on ${#KEYS[@]} issues..."
+
+          # Use ADF body per Jira Cloud v3 comment API
+          # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/
+          for KEY in "${KEYS[@]}"; do
+            ISSUE="$(echo "$KEY" | xargs)"
+            ADF=$(jq -n --arg t "Repo: ${REPO_NAME}" '{
+              body: {
+                type: "doc",
+                version: 1,
+                content: [
+                  { type: "paragraph", content: [ { type: "text", text: $t } ] }
+                ]
+              }
+            }')
+
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+              --data "${ADF}" \
+              "${JIRA_BASE_URL}/rest/api/3/issue/${ISSUE}/comment")
+
+            if [ "$http_code" != "201" ]; then
+              echo "WARN: Failed to add comment to ${ISSUE} (HTTP ${http_code})"
+            else
+              echo "Commented on ${ISSUE}"
+            fi
+          done
+
+      # ---------- (Your existing deployment status attachment) ----------
       - name: Attach Tag Metadata to Deployment
         if: always()
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get the latest deployment for this environment
           DEPLOYMENT_URL="${{ github.api_url }}/repos/${{ github.repository }}/deployments"
           DEPLOYMENT_ID=$(gh api "$DEPLOYMENT_URL" --jq '.[0].id')
 
@@ -85,3 +180,4 @@ jobs:
             -f environment="${{ inputs.environment || 'staging' }}" \
             -f log_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             -f auto_inactive=true
+``
